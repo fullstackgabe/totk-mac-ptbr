@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,10 +45,10 @@ static uint64_t handles[NH]; /* file index + 1; 0 is free */
    are served in place of the originals. Each line names a RomFS path, the overlay's size and SHA-256 and the original's
    SHA-256; a missing path, a size or hash mismatch or a changed original stops the start (regenerate the overlay).
    TOTK_ROMFS_PATCHES=0 serves the originals. */
-#define NOVL 16
+#define NOVL 4096 /* PT-BR dub overlay: about 1400 files */
 static struct { uint64_t index,size; int fd; } overlays[NOVL];
 static unsigned noverlay;
-static uint8_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */
+static uint16_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */
 typedef struct { uint64_t offset,size;uint32_t name,len; } Entry;
 _Static_assert(sizeof(Entry)==24,"index entry layout");
 static Entry entry(uint64_t i) {Entry e;memcpy(&e,index_bytes+24+i*24,24);return e;}
@@ -162,6 +163,7 @@ static void overlay_load(const char *dir,int required) {
 /* TOTK_ROMFS_PATCHES (default extracted/v0/romfs-patches; 0 = none), and with a true-2K output bigger than 1920x1080 also
    <TOTK_ROMFS_PATCHES_OUT, default extracted/v0/romfs-patches-out>/<w>x<h> (the HeapDef sizes, scripts/make_output_res_overlay.py). */
 static void overlay_init(void) {
+ {struct rlimit r;if(!getrlimit(RLIMIT_NOFILE,&r)&&r.rlim_cur<8192){r.rlim_cur=r.rlim_max<8192?r.rlim_max:8192;setrlimit(RLIMIT_NOFILE,&r);}} /* one open fd per overlay file */
  const char *dir=getenv("TOTK_ROMFS_PATCHES");if(!dir||strcmp(dir,"0"))overlay_load(dir?dir:"extracted/" TOTK_GAME_DIR "/romfs-patches",0);
  unsigned w,h;if(runtime_output_res(&w,&h)&&runtime_output_res_extra_bytes()){const char *out=getenv("TOTK_ROMFS_PATCHES_OUT");char d[4096];
   need(snprintf(d,sizeof(d),"%s/%ux%u",out?out:"extracted/" TOTK_GAME_DIR "/romfs-patches-out",w,h)<(int)sizeof(d),"RomFS output overlay path");overlay_load(d,1);}
@@ -205,13 +207,13 @@ void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
  if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=lower(p);if(i>=file_count||strcmp(p,entry_name(entry(i))))return NOT_FOUND;
- uint8_t ov=0;for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)ov=(uint8_t)(k+1);
+ uint16_t ov=0;for(unsigned k=0;k<noverlay;k++)if(overlays[k].index==i)ov=(uint16_t)(k+1);
  pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
 }
 static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=entry(i-1);return 1;}
 /* Where an open handle's bytes come from: the overlay file, or the original's range of the image. */
 static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint64_t *size) {
- pthread_mutex_lock(&lock);uint8_t ov=handle_ovl[h-0x100000000ULL];pthread_mutex_unlock(&lock);
+ pthread_mutex_lock(&lock);uint16_t ov=handle_ovl[h-0x100000000ULL];pthread_mutex_unlock(&lock);
  if(ov){*fd=overlays[ov-1].fd;*base=0;*size=overlays[ov-1].size;}else{*fd=image_fd;*base=e->offset;*size=e->size;}
 }
 unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {

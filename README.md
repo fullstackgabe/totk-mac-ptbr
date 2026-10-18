@@ -1,5 +1,7 @@
 # MacNativeGames
 
+> **Fork PT-BR:** versão com dublagem e legendas em português (mods da comunidade) e correção do analógico esquerdo do Pro Controller. Veja [ptbr/README.md](ptbr/README.md).
+
 # English
 
 > **Use your AI assistant to help you build the Mac app. We recommend Claude Code, Codex, or any other AI assistant you prefer.**

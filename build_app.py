@@ -34,8 +34,8 @@ UPDATED = json.loads((GAME / 'assets/expected-v1.1.2.json').read_text())
 UPDATED143 = json.loads((GAME / 'assets/expected-v1.4.3.json').read_text())
 VERSIONS = {'v0': EXPECTED, 'v112': UPDATED, 'v143': UPDATED143}
 HACTOOL = ('https://github.com/SciresM/hactool.git', '1d64a83450e025622f3468c28fc4164dad2c5ef6')
-APP_NAME = 'Tears of the Kingdom'
-BUNDLE_ID = 'org.macnativegames.totk'
+APP_NAME = 'Tears of the Kingdom PT-BR'
+BUNDLE_ID = 'org.macnativegames.totk.ptbr'
 LSREGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 # Pinned upstream sources fetched at build time (repository, commit)
 SPIRV_CROSS = ('https://github.com/KhronosGroup/SPIRV-Cross.git', 'aa217aeb6c9f0ace7a0ab233b28807edf45eb165')
