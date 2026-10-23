@@ -1,5 +1,7 @@
 # MacNativeGames
 
+> **Versão PT-BR:** dublagem e legendas em português (mods da comunidade), analógicos do Pro Controller via pro-bridge e correção do desvio do giroscópio. Veja [ptbr/README.md](ptbr/README.md). Projeto original: [ly05010419/MacNativeGames](https://github.com/ly05010419/MacNativeGames).
+
 # English
 
 **Breath of the Wild 1.6.0 and 1.9.0 are now officially supported on Mac!** (Mac only for now: no iPhone or iPad build yet.)

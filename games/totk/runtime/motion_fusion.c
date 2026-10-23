@@ -32,6 +32,15 @@ static int from[3] = {0, 1, 2};
 static double sign[3] = {1, 1, 1}, det = 1;
 static double deadzone = -1;   /* rad/s; -1 until read from TOTK_GYRO_DEADZONE */
 static double deadzone_default;   /* deg/s, when TOTK_GYRO_DEADZONE is unset */
+/* Gyro bias (2026-10-22): a Switch Pro Controller ("BRANCO") read 3.6, 7.2 and 1.1 deg/s at rest after its factory
+   calibration, far above the dead zone, so the bow aim crept to the right. As SDL/Ryujinx do, the bias is measured while
+   the controller is still: a window of BIAS_WINDOW samples whose gyro moves less than BIAS_STILL on every axis and whose
+   acceleration stays near 1 G gives the window's mean as the bias (first estimate taken as is, later ones blended).
+   TOTK_GYRO_BIAS=0 turns it off. */
+enum { BIAS_WINDOW = 96 };
+#define BIAS_STILL (2.0 * M_PI / 180)
+static double bias[3], win_sum[3], win_min[3], win_max[3];
+static int win_n, bias_known, bias_on = -1;
 
 /* TOTK_GYRO_AXES: reference axis i = sign * controller axis from[i]. 0 if unset, -1 if malformed. */
 int runtime_motion_axes(const char *spec) {
@@ -96,6 +105,28 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
     double acc[3], gyro[3];
     pthread_mutex_lock(&lock);
     for (int i = 0; i < 3; i++) { acc[i] = sign[i] * raw_acc[from[i]]; gyro[i] = det * sign[i] * raw_gyro[from[i]]; }
+    if (bias_on < 0) { const char *e = getenv("TOTK_GYRO_BIAS"); bias_on = !(e && !strcmp(e, "0")); }
+    if (bias_on) {
+        double g = norm3(acc);
+        int still = g > 0.9 && g < 1.1;
+        for (int i = 0; i < 3 && still; i++) {
+            if (!win_n) win_min[i] = win_max[i] = gyro[i];
+            if (gyro[i] < win_min[i]) win_min[i] = gyro[i];
+            if (gyro[i] > win_max[i]) win_max[i] = gyro[i];
+            still = win_max[i] - win_min[i] < BIAS_STILL;
+        }
+        if (!still) win_n = 0;
+        else {
+            for (int i = 0; i < 3; i++) win_sum[i] = (win_n ? win_sum[i] : 0) + gyro[i];
+            if (++win_n == BIAS_WINDOW) {
+                for (int i = 0; i < 3; i++) { double m = win_sum[i] / BIAS_WINDOW; bias[i] = bias_known ? bias[i] * 0.5 + m * 0.5 : m; }
+                if (!bias_known) fprintf(stderr, "[gyro] bias measured at rest: %+.2f %+.2f %+.2f deg/s (removed)\n",
+                                         bias[0] * 180 / M_PI, bias[1] * 180 / M_PI, bias[2] * 180 / M_PI);
+                bias_known = 1; win_n = 0;
+            }
+        }
+        for (int i = 0; i < 3; i++) gyro[i] -= bias[i];
+    }
     if (deadzone < 0) {
         const char *e = getenv("TOTK_GYRO_DEADZONE"); double v = deadzone_default;
         if (e) { char *end; v = strtod(e, &end); if (end == e || *end || !(v >= 0) || v > 20) runtime_fail("TOTK_GYRO_DEADZONE must be a number of degrees a second in [0, 20]"); }

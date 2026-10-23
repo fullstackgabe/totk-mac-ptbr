@@ -8,6 +8,13 @@
 #include "runtime.h"
 #include "gamepad_layout.h"   // face buttons by position (PlayStation, Xbox) or label (Nintendo)
 #include "controller_map.h"   // the player's button layout (controls.txt)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdatomic.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 static pthread_mutex_t gamepadLock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeGamepadState gamepadState;
@@ -74,6 +81,45 @@ static uint64_t gamepad_buttons(GCExtendedGamepad *pad, int by_position) {
     if ([pad isKindOfClass:GCDualSenseGamepad.class] && ((GCDualSenseGamepad *)pad).touchpadButton.isPressed) buttons |= 1ULL << 16;
     if ([pad isKindOfClass:GCDualShockGamepad.class] && ((GCDualShockGamepad *)pad).touchpadButton.isPressed) buttons |= 1ULL << 16;
     return buttons;
+}
+
+/* pro-bridge (~/htdocs/pro-bridge, DSU on 127.0.0.1:26760) reads the Switch Pro Controller through SDL3. Over Bluetooth, macOS
+   GameController never reports that controller's left stick (it arrives as a D-pad) and its right stick is unreliable, so
+   while DSU slot 0 is live its sticks and D-pad replace the GameController ones. */
+static _Atomic int32_t dsuLx, dsuLy, dsuRx, dsuRy;
+static _Atomic uint32_t dsuDpad;
+static _Atomic uint64_t dsuSeenMs;
+static uint64_t now_ms(void) { struct timeval tv; gettimeofday(&tv, NULL); return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000; }
+static int32_t dsu_axis(uint8_t v) { return stick_axis(((float)v - 128.0f) / 127.0f); }
+static void *dsu_thread(void *unused) {
+    (void)unused;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return NULL;
+    struct timeval timeout = {0, 500000};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    struct sockaddr_in server = {0};
+    server.sin_family = AF_INET; server.sin_port = htons(26760); server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    uint8_t request[28] = {0}, packet[128];
+    memcpy(request, "DSUC", 4);
+    uint16_t version = 1001, length = 12; uint32_t type = 0x100002, client = 0x544f544b;
+    memcpy(request + 4, &version, 2); memcpy(request + 6, &length, 2); memcpy(request + 12, &client, 4); memcpy(request + 16, &type, 4);
+    request[20] = 1; request[21] = 0;   /* subscribe by slot: slot 0 */
+    uint64_t lastRequest = 0; int announced = 0;
+    for (;;) {
+        uint64_t now = now_ms();
+        if (now - lastRequest >= 1000) { sendto(s, request, sizeof request, 0, (struct sockaddr *)&server, sizeof server); lastRequest = now; }
+        ssize_t n = recv(s, packet, sizeof packet, 0);
+        if (n < 44 || memcmp(packet, "DSUS", 4)) continue;
+        uint32_t message; memcpy(&message, packet + 16, 4);
+        if (message != 0x100002 || packet[20] != 0 || packet[21] != 2) continue;
+        uint8_t b = packet[36];
+        atomic_store(&dsuDpad, (b & 0x80 ? 1u << 12 : 0) | (b & 0x10 ? 1u << 13 : 0) | (b & 0x20 ? 1u << 14 : 0) | (b & 0x40 ? 1u << 15 : 0));
+        atomic_store(&dsuLx, dsu_axis(packet[40])); atomic_store(&dsuLy, dsu_axis(packet[41]));
+        atomic_store(&dsuRx, dsu_axis(packet[42])); atomic_store(&dsuRy, dsu_axis(packet[43]));
+        atomic_store(&dsuSeenMs, now_ms());
+        if (!announced) { announced = 1; fprintf(stderr, "[totk-input] pro-bridge DSU slot 0 live: sticks and D-pad from SDL3\n"); }
+    }
+    return NULL;
 }
 
 static void refresh_gamepads(void) {
@@ -159,6 +205,7 @@ void runtime_gamepad_start(void) {
                    }];
     for (GCController *controller in GCController.controllers) attach_gamepad(controller);
     [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+    pthread_t dsu; if (!pthread_create(&dsu, NULL, dsu_thread, NULL)) pthread_detach(dsu);
 }
 
 void runtime_gamepad_clear(void) {
@@ -188,6 +235,12 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     pthread_mutex_lock(&gamepadLock);
     *out = gamepadState;
     out->buttons |= touchState.buttons | pressedEdges;
+    if (now_ms() - atomic_load(&dsuSeenMs) < 300) {
+        out->connected = 1;
+        out->buttons = (out->buttons & ~(0xfULL << 12)) | atomic_load(&dsuDpad);
+        out->lx = stronger_axis(out->lx, atomic_load(&dsuLx)); out->ly = stronger_axis(out->ly, atomic_load(&dsuLy));
+        out->rx = stronger_axis(out->rx, atomic_load(&dsuRx)); out->ry = stronger_axis(out->ry, atomic_load(&dsuRy));
+    }
     out->lx = stronger_axis(out->lx, touchState.lx); out->ly = stronger_axis(out->ly, touchState.ly);
     out->rx = stronger_axis(out->rx, touchState.rx); out->ry = stronger_axis(out->ry, touchState.ry);
     if (touchState.connected) out->connected = 1;
