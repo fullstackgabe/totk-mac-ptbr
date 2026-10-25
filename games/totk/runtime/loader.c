@@ -51,11 +51,9 @@ void *runtime_symbol(const char *name) {
  return NULL;
 }
 uint8_t *runtime_module_base(const char *name){for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,name))return modules[i].base;return NULL;}
-#ifdef GAME_BOTW
 /* Is pc in a module's original code (not in the patch area, where rewritten windows and gates are)? Called from a signal
-   handler (threads.c, asynchronous preemption): only reads the module table. */
+   handler (threads.c, asynchronous preemption, both games): only reads the module table. */
 int runtime_guest_code_pc(uint64_t pc){for(unsigned i=0;i<NM;i++){uint64_t b=(uintptr_t)modules[i].base;if(b&&pc>=b&&pc-b<modules[i].text_end)return 1;}return 0;}
-#endif
 /* RELRO in newer SDKs protects relocated data after linking. Keep permissions at
  * the guest's 4 KiB granularity. A Darwin 16 KiB page receives the union of its
  * four guest permissions, so protecting an edge never removes access from an
@@ -198,9 +196,11 @@ static void map_module(Module *m,const char *dir) {
  make_hash(m);
  fprintf(stderr,"[totk] mapped %s size=%zu symbols=%u\n",m->name,m->size,m->nsym);
 }
-/* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) for ios/tools/gen_embed.py.
-   Relocations never reach the text (they start at DATA_OFF), so the exported bytes differ from the verified image only at
-   the patch sites; the count is printed and checked by the generator. */
+/* TOTK_EXPORT_IOS=<dir>: after the game patches, write each module's text [0, page_up(TEXT_END)) and patch area
+   [PATCH_OFF, page_up(file size)) for ios/tools/gen_embed.py (Breath of the Wild's exclusive-acquire patch also changes the
+   rewriter's patch area; Tears of the Kingdom's leave it as it is). Relocations never reach either (they start at
+   DATA_OFF, below PATCH_OFF), so the exported bytes differ from the verified image only at the patch sites; the counts
+   are printed. */
 static void export_ios_text(const char *rewritten,const char *out) {
  for(unsigned i=0;i<NM;i++){Module *m=&modules[i];char path[4096];size_t n=page_up(m->text_end);
   need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
@@ -208,7 +208,14 @@ static void export_ios_text(const char *rewritten,const char *out) {
   unsigned diff=0;for(size_t k=0;k<n;k+=4)if(memcmp(orig+k,m->base+k,4))diff++;free(orig);
   need(snprintf(path,sizeof path,"%s/%s.x0.bin",out,m->name)<(int)sizeof path,"export path");
   f=fopen(path,"wb");need(f&&fwrite(m->base,1,n,f)==n&&fclose(f)==0,"write exported text");
-  printf("%s text_bytes=%zu patched_words=%u\n",m->name,n,diff);}
+  size_t p0=m->patch_off,p1=page_up(m->file_size);need(p0<=p1&&p1<=m->size,"patch area layout");
+  need(snprintf(path,sizeof path,"%s/%s.patched.bin",rewritten,m->name)<(int)sizeof path,"image path");
+  f=fopen(path,"rb");need(f!=NULL,"open patched module");uint8_t *img=calloc(1,p1-p0);need(img!=NULL,"patch area buffer");
+  need(fseek(f,(long)p0,SEEK_SET)==0,"seek patch area");size_t got=fread(img,1,m->file_size-p0,f);fclose(f);need(got==m->file_size-p0,"read patch area");
+  unsigned pdiff=0;for(size_t k=0;k<p1-p0;k+=4)if(memcmp(img+k,m->base+p0+k,4))pdiff++;free(img);
+  need(snprintf(path,sizeof path,"%s/%s.x1.bin",out,m->name)<(int)sizeof path,"export path");
+  f=fopen(path,"wb");need(f&&fwrite(m->base+p0,1,p1-p0,f)==p1-p0&&fclose(f)==0,"write exported patch area");
+  printf("%s text_bytes=%zu patched_words=%u patch_area_bytes=%zu patched_words=%u\n",m->name,n,diff,p1-p0,pdiff);}
 }
 #endif
 static void relocate(Module *m) {
@@ -299,8 +306,13 @@ static void thread_cleanup(void) {
 }
 uint64_t runtime_now_ns(void) {mach_timebase_info_data_t tb;mach_timebase_info(&tb);return (uint64_t)((__uint128_t)mach_absolute_time()*tb.numer/tb.denom);}
 void runtime_dispatch(uint64_t ret,uint64_t *regs) {
- for(unsigned i=0;i<NM;i++)for(unsigned j=0;j<modules[i].ngate;j++) {
-  const Gate *g=&modules[i].gates[j];if((uintptr_t)modules[i].base+g->ret!=ret)continue;
+ for(unsigned i=0;i<NM;i++) {
+  uintptr_t b=(uintptr_t)modules[i].base;if(!b||ret<b)continue;
+  unsigned lo=0,hi=modules[i].ngate;   // gates sorted by return address (prepare_runtime.py)
+  while(lo<hi){unsigned m=(lo+hi)/2;if(b+modules[i].gates[m].ret<ret)lo=m+1;else hi=m;}
+  if(lo==modules[i].ngate||b+modules[i].gates[lo].ret!=ret)continue;
+  const Gate *g=&modules[i].gates[lo];
+  if(g->timer==2){runtime_spin_wait(i,g->original);return;}   // spin wait (patch_nso.py "Spin waits"): no register changes
   if(g->timer){mach_timebase_info_data_t tb;mach_timebase_info(&tb);__uint128_t ns=(__uint128_t)mach_absolute_time()*tb.numer/tb.denom;
    need(g->arg<31&&g->arg!=18,"timer target register");regs[g->arg]=(uint64_t)(ns*12/625);__atomic_fetch_add(&timer_calls,1,__ATOMIC_RELAXED);return;}
   __atomic_fetch_add(&svc_calls,1,__ATOMIC_RELAXED);runtime_svc(g->arg,regs,modules[i].name,g->original);return;
@@ -545,5 +557,5 @@ int main(int argc,char **argv) {
 #endif
  verify_identity(!strcmp(argv[2],"probe-identity-negative"));
  for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}
- if(!strcmp(argv[2],"probe-gpu-sampler-border")||!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-texels-region")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
+ if(!strcmp(argv[2],"probe-gpu-writeback")||!strcmp(argv[2],"probe-gpu-sampler-border")||!strcmp(argv[2],"probe-gpu-pool-retire")||!strcmp(argv[2],"probe-gpu-tex-slots")||!strcmp(argv[2],"probe-gpu-arg-epoch")||!strcmp(argv[2],"probe-gpu-anomaly")||!strcmp(argv[2],"probe-gpu-vertex-streams")||!strcmp(argv[2],"probe-gpu-layer-merge")||!strcmp(argv[2],"probe-gpu-cube-merge")||!strcmp(argv[2],"probe-gpu-texture-retire")||!strcmp(argv[2],"probe-gpu-texels-region")||!strcmp(argv[2],"probe-gpu-linear-rt")||!strcmp(argv[2],"probe-gpu-storage-view")||!strcmp(argv[2],"probe-gpu-compressed-alias")||!strcmp(argv[2],"probe-gpu-upload-batch")||!strcmp(argv[2],"probe-gpu-ds-clear")||!strcmp(argv[2],"probe-gpu-ub-rename")||!strcmp(argv[2],"probe-gpu-ubo-snapshot")||!strcmp(argv[2],"probe-gpu-drv-c0")||!strcmp(argv[2],"probe-gpu-dispatch-chain")||!strcmp(argv[2],"probe-gpu-copy-alias")||!strcmp(argv[2],"probe-gpu-srgb-view")||!strcmp(argv[2],"probe-gpu-depth-output"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-memory"))runtime_memory_probe();else if(!strcmp(argv[2],"probe-gfx"))runtime_gfx_probe(0);else if(!strcmp(argv[2],"probe-vpool"))runtime_vpool_probe();else if(!strcmp(argv[2],"probe-gpu-widen")||!strcmp(argv[2],"probe-gpu-blockrt")||!strcmp(argv[2],"probe-gpu-midclear")||!strcmp(argv[2],"probe-gpu-winding")||!strcmp(argv[2],"probe-gpu-tile"))runtime_gpu_path_probe(argv[2]);else if(!strcmp(argv[2],"probe-audio"))runtime_audio_probe();else if(!strcmp(argv[2],"probe-gfx-negative"))runtime_gfx_probe(1);else if(!strcmp(argv[2],"probe"))probe();else if(!strcmp(argv[2],"probe-fs"))runtime_fs_probe();else if(!strcmp(argv[2],"probe-swkbd"))runtime_swkbd_probe();else if(!strcmp(argv[2],"probe-save"))runtime_save_probe();else if(!strcmp(argv[2],"boot")){if(getenv("TOTK_VERIFY_STARTUP")||getenv("TOTK_HEADLESS"))boot();else runtime_front_run(boot);}else runtime_fail("unknown mode");return 0;
 }

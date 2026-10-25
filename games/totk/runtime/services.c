@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <ctype.h>
+#include "game_language.h"
 #include <string.h>
 #include <sys/mman.h>
 
@@ -279,39 +280,47 @@ static uint32_t performance_configuration[2];
 static void performance_config(int mode,int cfg) {if(mode<0||mode>1)runtime_fail("invalid performance mode");performance_configuration[mode]=(uint32_t)cfg;fprintf(stderr,"[totk] performance request mode=%d cfg=%x: native macOS scheduling\n",mode,(uint32_t)cfg);}
 /* The game's language: TOTK_LANG as given (a Switch language code), otherwise from a locale: TOTK_LOCALE, which the
    launcher sets to the app's first preferred language (BCP 47, e.g. "pt-BR"; it follows a per-app language), or else
-   the Mac's current locale. Brazil maps to "pt-BR" only in the 1.4.3 build and in Breath of the Wild 1.9.0, whose RomFS have the official USpt text. */
+   the Mac's current locale, mapped by game_language.h (regional variants as on the console: en-GB, fr-CA, es-419, and pt-BR
+   only in the 1.4.3 build and in Breath of the Wild 1.9.0, whose RomFS have the official USpt text). */
 static uint64_t desired_language(void) {
  const char *explicit=getenv("TOTK_LANG");char code[8]={0};
  if(explicit){if(strlen(explicit)>7)runtime_fail("language code too long");memcpy(code,explicit,strlen(explicit));}
  else {
-  char language[16]={0},region[4]={0};const char *tag=getenv("TOTK_LOCALE");
+  char language[16]={0},script[8]={0},region[4]={0};const char *tag=getenv("TOTK_LOCALE");
   if(tag&&*tag){
    size_t n=strcspn(tag,"-_");if(n<sizeof(language))memcpy(language,tag,n);
    for(const char *p=tag+n;*p;){p+=strspn(p,"-_");size_t k=strcspn(p,"-_");
-    if(k==2&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[1])){region[0]=(char)toupper((unsigned char)p[0]);region[1]=(char)toupper((unsigned char)p[1]);}
+    if(k==2&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[1])){region[0]=(char)toupper((unsigned char)p[0]);region[1]=(char)toupper((unsigned char)p[1]);region[2]=0;}
+    if(k==3&&isdigit((unsigned char)p[0])&&isdigit((unsigned char)p[1])&&isdigit((unsigned char)p[2]))memcpy(region,p,3);   /* UN M.49, e.g. es-419 */
+    if(k==4&&!script[0]&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[3])){for(size_t i=0;i<4;i++)script[i]=(char)(i?tolower((unsigned char)p[i]):toupper((unsigned char)p[i]));}
     p+=k;}
   } else {
    CFLocaleRef locale=CFLocaleCopyCurrent();
    CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);
+   value=CFLocaleGetValue(locale,kCFLocaleScriptCode);
+   if(value)CFStringGetCString(value,script,sizeof(script),kCFStringEncodingUTF8);
    value=CFLocaleGetValue(locale,kCFLocaleCountryCode);
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
   }
 #if defined(TOTK_GAME_V143) || defined(GAME_BOTW190)
-  const char *portuguese=!strcmp(region,"BR")?"pt-BR":"pt";
+  const int brazil=1;
 #else
-  const char *portuguese="pt";
+  const int brazil=0;
 #endif
-  const char *selected=!strcmp(language,"ja")?"ja":!strcmp(language,"de")?"de":!strcmp(language,"fr")?"fr":!strcmp(language,"es")?"es":!strcmp(language,"it")?"it":!strcmp(language,"nl")?"nl":!strcmp(language,"ru")?"ru":!strcmp(language,"ko")?"ko":!strcmp(language,"zh")?"zh-Hans":!strcmp(language,"pt")?portuguese:"en-US";
+  const char *selected=game_language(language,script,region,brazil);
   memcpy(code,selected,strlen(selected));
  }
  uint64_t result;memcpy(&result,code,8);
  fprintf(stderr,"[totk] language: %s (TOTK_LANG=%s TOTK_LOCALE=%s)\n",code,explicit?explicit:"-",getenv("TOTK_LOCALE")?getenv("TOTK_LOCALE"):"-");
  return result;
 }
+/* One line per game allocation came in bursts of 1000-3000 while the world streams (each a write to the log),
+   so only failures are logged unless TOTK_TRACE_ALLOC=1. */
+static int trace_alloc(void){static int v=-1;if(v<0){const char *e=getenv("TOTK_TRACE_ALLOC");v=e&&*e&&strcmp(e,"0");}return v;}
 static uint32_t observed_region(uint64_t *out,uint64_t size){
  uint8_t *fn=runtime_symbol("_ZN2nn2os21AllocateAddressRegionEPmm");uint32_t r=((uint32_t(*)(uint64_t *,uint64_t))fn)(out,size);
- fprintf(stderr,"[totk] AllocateAddressRegion size=%llx result=%x address=%llx\n",(unsigned long long)size,r,(unsigned long long)(r?0:*out));
+ if(r||trace_alloc())fprintf(stderr,"[totk] AllocateAddressRegion size=%llx result=%x address=%llx\n",(unsigned long long)size,r,(unsigned long long)(r?0:*out));
  if(r&&getenv("TOTK_TRACE_VAMM")){
   uint8_t *sdk=fn-0x12ca60;uint64_t root;memcpy(&root,sdk+0xd16bb8,8);uint64_t *v=(void *)(uintptr_t)(root+0x418);
   for(unsigned i=0;i<10;i++)fprintf(stderr,"[totk] VAMM +%x=%llx\n",i*8,(unsigned long long)v[i]);
@@ -319,7 +328,7 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
  }
  return r;
 }
-static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
+static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
  {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main}};
@@ -420,6 +429,10 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
  case 0x25: {uint64_t id;pthread_threadid_np(NULL,&id);r[0]=0;r[1]=id;return 0;}
  case 0x10:r[0]=0;return 0;
+ /* SynchronizePreemptionState: the SDK calls it after clearing ThreadLocalRegion disable_count (+0x100) when interrupt_flag
+    (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
+    SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
+ case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
  case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}

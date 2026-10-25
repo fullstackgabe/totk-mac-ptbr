@@ -1,0 +1,86 @@
+"""games/totk/ios/tools/build_ipa.py: what an iOS build leaves out of the way and copies (2026-10-23)."""
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parents[1]/'games/totk/ios/tools'
+sys.path.insert(0, str(TOOLS))
+import build_ipa  # noqa: E402
+import install_device  # noqa: E402
+
+
+class Discard(unittest.TestCase):
+    def test_a_folder_is_moved_aside_at_once_and_deleted_later(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); old = root/'TOTK.app'
+            (old/'GameData/shader-seed').mkdir(parents=True)
+            for i in range(50):
+                (old/f'GameData/shader-seed/{i}.metallib').write_bytes(b'x')
+            build_ipa.discard(old)
+            self.assertFalse(old.exists())   # the path is free for the new build right away
+            for _ in range(100):
+                if not any(root.iterdir()):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(list(root.iterdir()), [])   # and the moved folder is gone once the background delete ran
+
+    def test_a_missing_path_is_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            build_ipa.discard(Path(d)/'none')
+
+
+class SeedBeside(unittest.TestCase):
+    """--ios-game-data documents leaves the startup shaders beside the output; the README installs the .ipa, and the
+    seed was pushed only for an .app folder, so the game said 'No shaders' after a successful install."""
+    def layout(self, root, output):
+        (root/'Tears of the Kingdom-shader-seed').mkdir()
+        (root/'Tears of the Kingdom-shader-seed/fingerprint.txt').write_text('f' * 64)
+        app = root/'signed/Payload/TOTK.app'; (app/'GameData').mkdir(parents=True)
+        return root/output, app
+
+    def test_an_ipa_gets_its_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            ipa, app = self.layout(Path(d), 'Tears of the Kingdom.ipa'); ipa.write_bytes(b'PK')
+            self.assertEqual(install_device.seed_beside(ipa, app), Path(d)/'Tears of the Kingdom-shader-seed')
+
+    def test_an_app_folder_gets_its_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, app = self.layout(Path(d), 'Tears of the Kingdom.app'); out.mkdir()
+            self.assertEqual(install_device.seed_beside(out, out), Path(d)/'Tears of the Kingdom-shader-seed')
+
+    def test_an_app_that_carries_its_seed_gets_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            ipa, app = self.layout(Path(d), 'Tears of the Kingdom.ipa'); (app/'GameData/shader-seed').mkdir()
+            self.assertIsNone(install_device.seed_beside(ipa, app))
+
+
+def read_pack(parts):
+    """ios/Sources/main.m seed_unpack, in Python: the files of a pack stream cut into parts."""
+    data = b''.join(p.read_bytes() for p in parts); assert data[:9] == b'TOTKPACK1'; at, out = 9, {}
+    while True:
+        nl = int.from_bytes(data[at:at + 2], 'little'); at += 2
+        if not nl: return out, at == len(data)
+        name = data[at:at + nl].decode(); at += nl
+        size = int.from_bytes(data[at:at + 8], 'little'); at += 8
+        out[name] = data[at:at + size]; at += size
+
+
+class ShaderPack(unittest.TestCase):
+    def test_files_come_back_whole_across_part_boundaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); seed = root/'seed'; seed.mkdir(); parts = []
+            files = {'a.metal': b'x' * 1000, 'b.json': b'{}', 'empty.variants': b'', 'c.metallib': bytes(range(256)) * 3}
+            for n, b in files.items():
+                (seed/n).write_bytes(b)
+            install_device.write_pack(seed, sorted(files), root, 'shader-seed-x', 97, parts.append)
+            self.assertGreater(len(parts), 10)   # cut in the middle of names, sizes and contents
+            self.assertTrue(all(p.stat().st_size <= 97 for p in parts))
+            got, exact = read_pack(parts)
+            self.assertEqual(got, files)
+            self.assertTrue(exact)   # nothing after the end mark
+
+
+if __name__ == '__main__':
+    unittest.main()

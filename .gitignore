@@ -1,6 +1,8 @@
 .DS_Store
 __pycache__/
 *.pyc
+# what players' iPhones / iPads noted for the shared shader list (ios/tools/shader_contrib_watch.py): sent in an issue, not committed
+/shader-list-contribution/
 # never commit keys or game files
 *.keys
 *.xci
@@ -12,6 +14,7 @@ __pycache__/
 *.sav
 # build output (the work folder normally lives next to the card image)
 TOTK_build/
+BotW_build/
 *.app/
 games/totk/.venv
 games/totk/build/
@@ -24,3 +27,4 @@ games/totk/tools/totk_xlate/obj/
 games/totk/tools/totk_xlate/bin/
 games/totk/scripts/shader_inventory/obj/
 games/totk/scripts/shader_inventory/bin/
+ultracode.md
