@@ -1,7 +1,14 @@
-# Tears of the Kingdom nativo no Mac — PT-BR
+# Zelda nativo no Mac — PT-BR
 
-Versão do [MacNativeGames](https://github.com/ly05010419/MacNativeGames) (de ly05010419, licença MIT) com **dublagem e
-legendas em português** e duas correções de controle. O port em si — o código do jogo rodando direto no Apple Silicon,
+Versão do [MacNativeGames](https://github.com/ly05010419/MacNativeGames) (de ly05010419, licença MIT) para jogar
+**Tears of the Kingdom** e **Breath of the Wild** em português, com duas correções de controle que valem para os dois
+jogos.
+
+| Jogo | Versão | Português |
+|---|---|---|
+| Tears of the Kingdom | 1.4.3 | dublagem + legendas |
+| Breath of the Wild | 1.6.0 + DLCs 1 e 2 | legendas (vozes em inglês) |
+ O port em si — o código do jogo rodando direto no Apple Silicon,
 os serviços do Switch e os gráficos NVN sobre Metal — é todo do projeto original. Os créditos da dublagem e da tradução
 são dos autores dos mods (Triforce Heroes).
 
@@ -18,9 +25,11 @@ Este repositório **não contém nenhum arquivo do jogo, keys nem dos mods**. Vo
   sempre que o controle fica parado por cerca de meio segundo e é descontado, como no SDL/Ryujinx.
   `TOTK_GYRO_BIAS=0` desliga essa correção.
 
+As correções ficam no runtime compartilhado (`games/totk/runtime`), que os dois apps usam.
+
 O português entra como **mod do jogador** (o projeto original já carrega mods de RomFS), sem mudar o build.
 
-## Como gerar (1.4.3)
+## Tears of the Kingdom (1.4.3)
 
 Você precisa do jogo base 1.0.0 (XCI ou NSP), do update **1.4.3**, do seu `prod.keys` e de duas pastas `romfs/`:
 
@@ -55,13 +64,35 @@ O jogo precisa rodar em `en-US`. Para fixar (e manter depois de reiniciar, com u
 launchctl setenv TOTK_LANG en-US
 ```
 
+## Breath of the Wild (1.6.0 + DLCs)
+
+Você precisa do jogo base (NSP), do update **1.6.0** (`v786432`), das DLCs que tiver e do seu `prod.keys`:
+
+```sh
+python3.14 build_app.py ~/Games/botw.nsp -k ~/keys/prod.keys --update ~/Games/botw-1.6.0.nsp \
+    --dlc ~/Games/botw-dlc1.nsp --dlc ~/Games/botw-dlc2.nsp
+```
+
+A legenda em português vem do mod **Tradução Triforce Heroes** (só textos). Copie o conteúdo da pasta `romfs/` dele para
+a pasta de mods da 1.6.0 e gere o manifesto:
+
+```sh
+MODDIR="$HOME/Library/Application Support/MacNativeGames/BotW/mods/botw160"
+mkdir -p "$MODDIR" && cp -R "/caminho/Tradução Triforce Heroes/romfs/." "$MODDIR/"
+python3 games/totk/scripts/make_mod_manifest.py "$MODDIR" --app "/caminho/Breath of the Wild.app"
+```
+
+O mod traz a própria `ResourceSizeTable` (o texto em português é maior que o original). O jogo precisa rodar em
+`en-US`: `defaults write org.macnativegames.botw AppleLanguages -array en-US`.
+
 ## Saves
 
-Ficam em `~/Library/Application Support/MacNativeGames/TOTK/profile`, fora do app. Na primeira vez que uma versão nova
+O TOTK guarda em `~/Library/Application Support/MacNativeGames/TOTK/profile` e o BOTW em `.../MacNativeGames/BotW/profile`,
+fora do app. Na primeira vez que uma versão nova
 abre, o app faz um backup completo (`profile-before-1.4.3`). Um save de versão mais nova não abre numa versão mais antiga.
 
 ## Limitações
 
-- A tela de título e algumas texturas de menu ficam em inglês: os arquivos `Common`/`Title.Product.110` do mod foram
+- TOTK: a tela de título e algumas texturas de menu ficam em inglês: os arquivos `Common`/`Title.Product.110` do mod foram
   feitos para a 1.2.1 e a 1.4.3 não os carrega.
-- Os mods foram feitos para 1.2.1/1.4.2: alguma fala pode ficar sem voz ou sem tradução.
+- TOTK: os mods foram feitos para 1.2.1/1.4.2: alguma fala pode ficar sem voz ou sem tradução.
