@@ -188,6 +188,8 @@ static void *dsu_thread(void *unused) {
         if (!announced) { announced = 1; fprintf(stderr, "[totk-input] pro-bridge DSU slot 0 live: sticks and D-pad from SDL3\n"); }
     }
     return NULL;
+}
+
 #if TARGET_OS_OSX
 /* ---- Generic HID pads macOS will not hand to GameController ----
 
