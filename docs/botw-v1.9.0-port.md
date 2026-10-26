@@ -112,6 +112,13 @@ Two changes act on both BOTW versions:
   staged texture from its stage. Larger textures keep the read-back blit. With staging, Kakariko holds 59.5 FPS at the
   60 FPS cap. A timer in a test build measured the stage copies at 107 us per game frame (103-113 us, 14 copies and
   4.7 new buffers a frame). That is 1.3 % of a 120 FPS frame.
+- Grass masks (after f1043e5): the game flushes its 512x512 grass density mask right after rendering it and reads it on
+  the CPU to choose the grass cells 50-130 m away. The flush write-back waited about 3.7 ms a frame for that rendering.
+  A target the flush has had to wait for 120 times (1 MiB at most) now lands in memory when its submission completes,
+  and the flush no longer waits: the CPU reads the last completed mask, as on hardware, where the game does not wait for
+  it either. This also learns the 64x64 light-probe cube maps. Great Plateau at the 120 FPS ceiling: 114-120 FPS and p99
+  11.7-15.6 ms before, 119.6-120 FPS and p99 10.6-11.0 ms after. `TOTK_BOTW_LATE_WB=0` restores the waiting write-back.
+  `probe-gpu-writeback` covers the landing, neighbour and own CPU writes on the shared edge pages, and a short pool.
 - 120 Hz displays: the uncapped mode stays off on a display of 120 Hz or more (`UNCAPPED_HZ`). The BOTW rule that
   ignores the game's present interval 2 acted only in that mode, so BOTW ran at 60 FPS on a 120 Hz display. The
   display-following path now ignores interval 2 in the same cases: real time, `DM_PRESENT_HZ` unset, `TOTK_UNCAPPED`,
@@ -120,6 +127,10 @@ Two changes act on both BOTW versions:
   - Replaced after the merge (user 2026-10-22): the uncapped mode applies on any display, so this rule is gone. Its
     clock's ceiling went to 240, then back to 120 by default the same day (user; `TOTK_UNCAPPED_HZ` still allows up to 240). The real-time frame step lost its 1/120 s floor (TOTK and BOTW), which made a game
     above 120 fps run fast; the Unicorn checks of both versions pass at 144, 165, 240 and 360 fps.
+  - The display link that shows the uncapped frames keeps a display rate above 120 Hz too, up to 240 (`link_range` in
+    `nvn_mtl.m`; TOTK and BOTW). It turned such a rate into 60, so a 144 / 160 Hz display ticked at a divisor of its
+    refresh: on a 160 Hz display about 53 frames a second reached the screen, 18.75 / 25 ms apart, while the game ran
+    at 105-120 fps. Only an unknown rate (below 30) still falls back to 60.
 
 Write-back staging A/B on `29bc388`, with upstream's #140 and #143 in the build: Kakariko, uncapped, docked 1920x1080
 render, warm shader cache v6, still view from 115 s for 20 s, then a 15 s walk. The "off" build used the TOTK hooks.

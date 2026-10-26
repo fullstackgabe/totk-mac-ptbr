@@ -130,6 +130,7 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
 static int fence_wait(uint64_t k, uint64_t timeout_ns);
+static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
 static void x_drain(void);
 static int async_replay(void);
 static int call_stats_on(void);
@@ -629,6 +630,15 @@ NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f)
 // and calls whose fence was the newest committed one (a full drain of the queue).
 _Atomic uint64_t g_sw_calls[2], g_sw_blocked[2], g_sw_ns[2], g_sw_newest[2];
 static int synclog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_SYNC_LOG") != NULL; return on; }
+/* TOTK_SYNC_LAG=1 (runtime "flag sync_lag 0|1"; off by default): the game's main thread waits every frame for the GPU to
+   finish the frame it has just submitted (SyncWait on the newest fence, from observed_main; ~7 ms a frame in a heavy
+   world scene on an M4 Air), so the game's CPU frame and the GPU frame never overlap. With the switch such a wait settles
+   for the submission before it: the main thread computes frame N+1 while the GPU still draws frame N. A wait for any older
+   fence is unchanged, and with the translation thread the newest submission must still be translated (its command memory
+   is free again) before the wait returns; only the GPU part lags by one frame. */
+static _Atomic int g_sync_lag = -1;
+void nvn_set_sync_lag(int on) { atomic_store(&g_sync_lag, on != 0); LOG("[flag] sync_lag = %d", on != 0); }
+static int sync_lag_on(void) { int v = atomic_load(&g_sync_lag); if (v < 0) { const char *e = getenv("TOTK_SYNC_LAG"); v = e && atoi(e) > 0; atomic_store(&g_sync_lag, v); if (v) LOG("[nvn] TOTK_SYNC_LAG=1：游戏等最近一次提交的 GPU 完成时放宽到上一次提交 | waits for the newest submission settle for the one before it"); } return v; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
@@ -636,11 +646,13 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     int k = (o->fenced & 2) != 0, lg = synclog_env();
     if (lg) { atomic_fetch_add(&g_sw_calls[k], 1); if (o->fence == mtl_last_fence()) atomic_fetch_add(&g_sw_newest[k], 1); }
     int tok = (o->fenced & 4) != 0;
-    if (tok ? fence_wait(o->fence, 0) : mtl_wait(o->fence, 0)) { survey_after_wait(s); mtl_wb_fence_done(); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    uint64_t want = o->fence;   // the fence whose GPU completion is waited for (TOTK_SYNC_LAG: one submission earlier)
+    if (want > 1 && sync_lag_on()) { int t; if (tok ? fence_now(&t) == want : want == mtl_last_fence()) want--; }
+    if (tok ? fence_wait_to(o->fence, want, 0) : mtl_wait(want, 0)) { survey_after_wait(s); mtl_wb_fence_done(); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    int ok = tok ? fence_wait_to(o->fence, want, timeout) : mtl_wait(want, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) { survey_after_wait(s); mtl_wb_fence_done(); }
@@ -902,7 +914,50 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
 #endif
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
+static uint8_t *flatten_recording_ops(const uint8_t *p);
+/* TOTK_FLATTEN_FAST (default on; =0 the op-by-op copy, =2 both and compare), 2026-10-24: a recording sits contiguous in
+   the recorder's one buffer (cmd_reserve reallocs it whole), so the copy is one exact-size allocation and one memcpy after
+   a header walk that checks the ops and works out what the op-by-op copy derives. The op-by-op copy grew its buffer from
+   4 KiB by doubling (realloc moved the bytes each time) and called memcpy per op: ~0.5 ms per frame on the game's main
+   thread at Kakariko (tl-dghot: memmove 51 + realloc 32 samples of 965 busy). A recording with a jump goes the old way. */
+static int flatten_fast_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FLATTEN_FAST"); v = e ? atoi(e) : 1; } return v; }
 static uint8_t *flatten_recording(const uint8_t *p) {
+    int mode = flatten_fast_mode();
+    if (!mode) return flatten_recording_ops(p);
+    const uint8_t *q = p; int bulk_ok = 1, first = 1; uint32_t last_size = 0, end_size = 0;
+    for (;;) {
+        op_hdr h; memcpy(&h, q, sizeof h);
+        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)q, h.op, h.size);
+        if (h.op == OP_JUMP) return flatten_recording_ops(p);
+        if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
+        if (first) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; first = 0; }
+        else if (h.op == OP_BEGIN) bulk_ok = 0;
+        else if (h.op != OP_END) last_size = h.size;
+        q += h.size;
+        if (h.op == OP_END) { end_size = h.size; break; }
+    }
+    size_t len = (size_t)(q - p), n = sizeof(copy_prefix) + len;
+    uint8_t *out = malloc(n); if (!out) die("command copy allocation");
+    memcpy(out + sizeof(copy_prefix), p, len);
+    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits;
+#ifdef GAME_BOTW
+    c->used = 0;
+#endif
+    size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+    c->last_size = c->body_bytes ? last_size : 0;
+    g_copy_bytes += malloc_size(out);
+    if (mode == 2) {   /* self-check: the op-by-op copy must be byte-identical, prefix fields included */
+        uint8_t *ref = flatten_recording_ops(p); copy_prefix *r = (copy_prefix *)ref - 1;
+        static _Atomic uint64_t checked;
+        if (malloc_size(r) < n || memcmp(out + sizeof(copy_prefix), ref, len) || r->body_bytes != c->body_bytes || r->last_size != c->last_size)
+            die("TOTK_FLATTEN_FAST=2: fast copy differs (len %zu, body %u/%u, last %u/%u)", len, c->body_bytes, r->body_bytes, c->last_size, r->last_size);
+        g_copy_bytes -= malloc_size(r); free(r);
+        if (!(atomic_fetch_add(&checked, 1) % 20000)) LOG("[flatten] TOTK_FLATTEN_FAST=2: %llu recordings identical", (unsigned long long)checked + 1);
+    }
+    return out + sizeof(copy_prefix);
+}
+static uint8_t *flatten_recording_ops(const uint8_t *p) {
     size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
     int bulk_ok = 1; uint32_t last_size = 0;
     if (!out) die("command copy allocation");
@@ -1123,7 +1178,7 @@ static int inline_bulk_on(void) {
     int v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     if (v < 0) {
         const char *e = getenv("TOTK_INLINE_BULK"); int expected = -1;
-        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e && !strcmp(e, "1"));
+        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e ? strcmp(e, "0") != 0 : !TOTK_BOTW_BUILD);   // default on since 2026-10-21 (TOTK; Breath of the Wild =1); TOTK_INLINE_BULK=0 off
         v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     }
     return v;
@@ -2060,7 +2115,10 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 //    job of that image's last present, then for its present ticket as before. The replay frame number travels in the job.
 //  - Operations that destroy or read Metal state (pool / texture / program finalize, ReadTexels / WriteTexels, QueueFinish,
 //    suspend) wait until the queue is empty first (x_drain), so they never overtake a queued replay that still uses them.
-// TOTK_ASYNC_REPLAY=0 (default for now) runs everything on the calling thread as before.
+// TOTK_ASYNC_REPLAY=0 runs everything on the calling thread as before. Default on since 2026-10-21: the NX Optimizer
+// benchmark (bench_run.py) kept its average and raised the 1% / 0.1% lows from 35 / 27 to 38-39 / 30-31 fps, and the
+// 94-frame picture comparison with citron showed no difference from the synchronous replay. On the Mac only: the iPhone
+// and iPad keep the synchronous replay unless TOTK_ASYNC_REPLAY=1 (not measured there).
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
 typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
@@ -2073,7 +2131,7 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e && atoi(e) > 0; if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e ? atoi(e) > 0 : TARGET_OS_OSX && !TOTK_BOTW_BUILD;   /* Breath of the Wild: not measured with it yet, =1 turns it on */ if (v) LOG("[nvn] 翻译线程：提交与出图排队交给独立线程回放（TOTK_ASYNC_REPLAY=0 关）"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
@@ -2142,7 +2200,9 @@ static uint64_t fence_now(int *token) {
     pthread_mutex_lock(&g_xq_mu); uint64_t k = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); *token = 1; return k;
 }
 // Waits for a token: the submit has been translated, then the Metal fence it ended with. 1 = reached.
-static int fence_wait(uint64_t k, uint64_t timeout_ns) {
+static int fence_wait(uint64_t k, uint64_t timeout_ns) { return fence_wait_to(k, k, timeout_ns); }
+// Submit k must be translated; the GPU wait is for the fence of submit kg <= k (TOTK_SYNC_LAG).
+static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns) {
     uint64_t t0 = now_ns();
     pthread_mutex_lock(&g_xq_mu);
     if (g_xsub_done < k) {
@@ -2152,7 +2212,7 @@ static int fence_wait(uint64_t k, uint64_t timeout_ns) {
         while (g_xsub_done < k) if (pthread_cond_timedwait(&g_xq_cv, &g_xq_mu, &dl)) break;
     }
     int ok = g_xsub_done >= k;
-    uint64_t f = !k ? 0 : g_xsub_done - k < XF ? g_xsub_fence[k % XF] : mtl_last_fence();   // older entries were overwritten: a later fence is conservative
+    uint64_t f = !kg ? 0 : g_xsub_done - kg < XF ? g_xsub_fence[kg % XF] : mtl_last_fence();   // older entries were overwritten: a later fence is conservative
     pthread_mutex_unlock(&g_xq_mu);
     if (!ok) return 0;
     uint64_t used = now_ns() - t0;
@@ -2360,11 +2420,29 @@ static int phone_holds_30(void) {
     return 0;
 #endif
 }
-static int game_holds_30(void) { return runtime_game_fps_limit() == 30 || phone_holds_30(); }
-static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_holds_30() && (m == MFX_OFF || m == MFX_MAX); }
-/* 30+30 on a display whose rate is not a multiple of 30 (the user's 100 Hz): the game is paced by our own clock at exactly
-   30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
-static int mfx_own_clock(void) { return (mfx_enabled() == MFX_30 || game_holds_30()) && (g_paced_hz <= 0 || g_paced_hz % 30); }
+/* The frame lock (the Mac settings panel, runtime/settings_panel.h; user 2026-10-25 "锁帧"): 0 off, 30, 40 or 60. The game is
+   then paced at exactly that rate as the 30 fps hold above does it (display ticks where the rate divides the display's,
+   our own clock otherwise), with the uncapped clock suspended; the real-time frame step keeps game speed right. A movie
+   or the phone's 30 fps hold still wins; so do the interpolation modes that hold the game (30+30, 40+40, 50+50), which the
+   panel never leaves on together with a lock. */
+static _Atomic int g_fps_lock;
+void nvn_fps_lock_set(int fps) {
+    fps = fps == 30 || fps == 40 || fps == 60 ? fps : 0;
+    if (atomic_exchange(&g_fps_lock, fps) != fps) { if (fps) LOG("[nvn] 锁帧：%d 帧", fps); else LOG("[nvn] 锁帧：关"); }
+}
+int nvn_fps_lock(void) { return atomic_load(&g_fps_lock); }
+/* The rate the game is held at now (0: not held): 30 for a movie or the phone's hold, then 30 / 40 / 50 for interpolation
+   30+30 / 40+40 / 50+50, else the frame lock. */
+static int game_hold_fps(void) {
+    if (runtime_game_fps_limit() == 30 || phone_holds_30()) return 30;
+    int m = mfx_hold_fps(mfx_enabled());
+    return m ? m : atomic_load(&g_fps_lock);
+}
+static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_hold_fps() && (m == MFX_OFF || m == MFX_MAX); }
+/* A held rate on a display whose rate is not a multiple of it (30 on the user's 100 Hz): the game is paced by our own clock
+   at exactly that rate instead of by the display link (3 refreshes would be 33 fps); the display link still shows each
+   picture at a refresh. */
+static int mfx_own_clock(void) { int r = game_hold_fps(); return r && (g_paced_hz <= 0 || g_paced_hz % r); }
 /* Opt-in until live scene/clock validation (Breath of the Wild: on by default, UNCAPPED_INTERVAL_FROM_ENV in nvn_obj.h).
    Only applies to the existing Mac real-time uncapped path; original timing, MetalFX and deterministic tests
    retain the guest interval. GPU/texture lifetime waits are unchanged. */
@@ -2744,23 +2822,22 @@ static void present_cfg(const win_t *o) {
 }
 static unsigned present_ticks(const win_t *o) {   /* display ticks per game frame */
     present_cfg(o);
-    /* TOTK_MFX / key 2: MetalFX makes the frame between two game frames. Half the refresh rate: the game presents every
-       second display tick (50 + 50 on a 100 Hz display); 30+30: hz / 30 ticks (2 at 60 Hz; at 100 Hz the own clock paces,
+    /* TOTK_MFX / the settings panel: MetalFX makes the frame between two game frames. 30+30 / 40+40 / 50+50 (and the frame
+       lock): hz / rate ticks (50 at 100 Hz: 2; where the rate does not divide the display's, the own clock paces,
        mfx_own_clock). Held here and not only by the game's controller, because the code carries the 60 FPS patch (the
        controller may choose 1); the real-time frame step keeps game speed right. Uncapped interpolation paces as uncapped. */
-    int m = mfx_enabled();
-    if (m == MFX_HALF && !game_holds_30()) return 2;
-    if (m == MFX_30 || game_holds_30()) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= 45 ? (hz + 15) / 30 : 1); }
+    int hold = game_hold_fps();
+    if (hold) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= hold * 3 / 2 ? (hz + hold / 2) / hold : 1); }
     return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
 }
 static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
     { static int was = -1; if (was >= 0 && m != was)
-        LOG("[nvn] 出图节拍切换：%s", m == MFX_30 ? (mfx_own_clock() ? "补帧 30+30：游戏按自己的时钟每秒 30 帧" : "补帧 30+30：跟随显示器，每秒 30 帧") :
-                                    m == MFX_HALF ? "补帧 刷新率一半：跟随显示器、每两次刷新一帧" :
+        LOG("[nvn] 出图节拍切换：%s%s", mfx_hold_fps(m) ? (mfx_own_clock() ? "补帧：游戏按自己的时钟每秒 " : "补帧：跟随显示器，游戏每秒 ") : "",
+                                    mfx_hold_fps(m) ? (m == MFX_30 ? "30 帧（30+30）" : m == MFX_40 ? "40 帧（40+40）" : "50 帧（50+50）") :
                                     m == MFX_MAX ? (g_uncapped ? "补帧 不限帧：不限帧率，每帧补一帧" : "补帧 不限帧：按游戏的出图间隔，每帧补一帧") :
                                     g_uncapped ? "补帧关：不限帧率" : "补帧关：按游戏的出图间隔"); was = m; }
-    if (m == MFX_30 || game_holds_30()) return 1000000000ull / 30;   /* exactly 30 fps, by display ticks or by our own clock */
+    { int hold = game_hold_fps(); if (hold) return 1000000000ull / (uint64_t)hold; }   /* exactly the held rate, by display ticks or by our own clock */
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 /* Exercise production policy, including the shrine's interval=2 and the
@@ -2786,19 +2863,45 @@ void dm_nvn_probe_present_interval(void) {
        over, so the uncapped pacing stays and the half-rate check fails. */
     extern void mfx_set(int mode); extern int mfx_latch(void);
     int saved_paced = g_paced_hz, saved_mfx = mfx_enabled();
-    mfx_set(MFX_HALF); if (!(neg && atoi(neg) == 20)) mfx_latch();
+    mfx_set(MFX_50); if (!(neg && atoi(neg) == 20)) mfx_latch();
     for (int uncapped = 0; uncapped < 2; uncapped++) for (int interval = -1; interval <= 3; interval++) {
         win_t w = {.interval = interval}; g_paced_hz = 100; g_hz = uncapped ? UNCAPPED_HZ : 100; g_display_mode = 0; g_uncapped = uncapped;
         if (present_ticks(&w) != 2 || present_period(&w) != 2 * 1000000000ull / 100 || uncapped_now() || mfx_own_clock())
-            die("present interval probe: frame interpolation must pace two display ticks at the display rate");
+            die("present interval probe: 50+50 on a 100 Hz display must pace two display ticks");
         checked++;
     }
+    /* 40+40: exactly 1/40 s, by display ticks at 120 Hz (3), our own clock at 60 / 100 / 144 Hz. */
+    mfx_set(MFX_40); mfx_latch();
+    { const int r40[] = {60, 100, 120, 144};
+      for (int r = 0; r < 4; r++) { win_t w = {.interval = 1}; g_paced_hz = r40[r]; g_hz = r40[r]; g_display_mode = 0; g_uncapped = 1;
+        if (present_period(&w) != 1000000000ull / 40 || uncapped_now() || mfx_own_clock() != (r40[r] % 40 != 0) || (r40[r] == 120 && present_ticks(&w) != 3))
+            die("present interval probe: 40+40 must pace exactly 40 fps");
+        checked++; } }
     mfx_set(MFX_30); mfx_latch();
     const int rates[] = {60, 100, 120, 144}; const unsigned ticks30[] = {2, 3, 4, 5};
     for (int r = 0; r < 4; r++) for (int uncapped = 0; uncapped < 2; uncapped++) {
         win_t w = {.interval = 1}; g_paced_hz = rates[r]; g_hz = uncapped ? UNCAPPED_HZ : rates[r]; g_display_mode = 0; g_uncapped = uncapped;
         if (present_period(&w) != 1000000000ull / 30 || present_ticks(&w) != ticks30[r] || uncapped_now() || mfx_own_clock() != (rates[r] % 30 != 0))
             die("present interval probe: 30+30 must pace exactly 30 fps (display ticks at 60 / 120 Hz, our own clock at 100 / 144 Hz)");
+        checked++;
+    }
+    /* The frame lock at 60 (interpolation off): exactly 1/60 s, by display ticks at 60 / 120 Hz, our own clock at 100 / 144
+       Hz, the uncapped clock suspended; at 30 the same as the 30 fps hold. Off again: the uncapped pacing. */
+    mfx_set(MFX_OFF); mfx_latch();
+    const unsigned ticks60[] = {1, 2, 2, 2};
+    for (int r = 0; r < 4; r++) for (int uncapped = 0; uncapped < 2; uncapped++) {
+        win_t w = {.interval = 2}; g_paced_hz = rates[r]; g_hz = uncapped ? UNCAPPED_HZ : rates[r]; g_display_mode = 0; g_uncapped = uncapped;
+        nvn_fps_lock_set(60);
+        if (present_period(&w) != 1000000000ull / 60 || present_ticks(&w) != ticks60[r] || uncapped_now() || mfx_own_clock() != (rates[r] % 60 != 0))
+            die("present interval probe: the 60 fps lock must pace exactly 60 fps");
+        nvn_fps_lock_set(30);
+        if (present_period(&w) != 1000000000ull / 30 || present_ticks(&w) != ticks30[r] || uncapped_now() || mfx_own_clock() != (rates[r] % 30 != 0))
+            die("present interval probe: the 30 fps lock must pace as the 30 fps hold");
+        nvn_fps_lock_set(40);
+        if (present_period(&w) != 1000000000ull / 40 || uncapped_now() || mfx_own_clock() != (rates[r] % 40 != 0))
+            die("present interval probe: the 40 fps lock must pace exactly 40 fps");
+        nvn_fps_lock_set(0);
+        if (uncapped_now() != uncapped) die("present interval probe: the lock off must give the uncapped pacing back");
         checked++;
     }
     mfx_set(MFX_MAX); mfx_latch();

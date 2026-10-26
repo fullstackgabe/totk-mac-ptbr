@@ -69,8 +69,8 @@ static NSString *seed_unpack(NSString *base, NSString *dest, void (^progress)(ui
     return nil;
 }
 static void *run_host(void *unused) { (void)unused; return (void *)(intptr_t)totk_host_main(3, host_argv); }
-/* The desktop keyboard-overlay shortcut has no counterpart on iOS. */
-void runtime_shortcut_help_toggle(void) {}
+/* Key 1's settings panel is Mac only (runtime/frontend.m). */
+void runtime_settings_toggle(void) {}
 
 @interface TOTKMetalView : UIView @end
 @implementation TOTKMetalView
@@ -222,6 +222,7 @@ static void audio_observe(void) {
     if (debugLog) { if (freopen(log.fileSystemRepresentation,"w",stderr)) setvbuf(stderr,NULL,_IOLBF,0); }
     else { [fm removeItemAtPath:log error:nil]; if (freopen("/dev/null","w",stderr)) setvbuf(stderr,NULL,_IOFBF,1<<16); }
     setenv("TOTK_ROMFS",[res stringByAppendingPathComponent:@"romfs"].fileSystemRepresentation,1);
+    setenv("TOTK_GAME_DATA",[res stringByAppendingPathComponent:@"game-data"].fileSystemRepresentation,1);   // runtime/game_data.h
     /* The 17 GB image may live in Documents/GameData instead of the app (romfs.bin or romfs.bin.000, ...; ios/tools/
        install_device.py --game-data puts it there): a new build then installs without it, and reinstalling keeps it.
        Excluded from iCloud backups. The runtime still hashes it once against the build's pin (TOTK_ROMFS_PROOF_DIR). */
@@ -275,6 +276,19 @@ static void audio_observe(void) {
     setenv("TOTK_MFX_UPSCALE","0",0);
     setenv("TOTK_FPS_OVERLAY","0",0);
 #else
+    /* Settings › Full HD (docked), Tears of the Kingdom only, off by default (a Vision Pro contributor's patch, user
+       2026-10-25): the game's docked settings as the Vision Pro build uses them, 1920x1080 output on a 1080-row drawable
+       with the scene at 1600x900 (1.4.3 renders 960x540 on the phone otherwise, game_patches_v143.c render_res). Off is the
+       handheld 1280x720 the phones were tested at. The Settings pane of Breath of the Wild has no such switch
+       (build_ipa.py). */
+#ifndef GAME_BOTW
+    if ([NSUserDefaults.standardUserDefaults boolForKey:@"TOTK_DOCKED"]) {
+        setenv("TOTK_OPERATION_MODE","docked",1);
+        setenv("TOTK_IOS_DRAWABLE_H","1080",0);
+        setenv("TOTK_RENDER_RES","1600x900",0);
+        fprintf(stderr, "[totk] Settings › Full HD: docked, 1920x1080 output, 1600x900 scene\n");
+    } else
+#endif
     setenv("TOTK_OPERATION_MODE","handheld",1);
 #endif
     // Game language: the Settings app (Settings.bundle › TOTK_LANG) stores the choice in our defaults; empty means the
